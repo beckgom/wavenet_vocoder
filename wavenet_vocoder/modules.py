@@ -5,35 +5,38 @@ import math
 import numpy as np
 
 import torch
+from wavenet_vocoder import conv
 from torch import nn
-from torch.autograd import Variable
 from torch.nn import functional as F
 
 
-def ConvTranspose2d(in_channels, out_channels, kernel_size,
-                    weight_normalization=True, **kwargs):
+def Conv1d(in_channels, out_channels, kernel_size, dropout=0, **kwargs):
+    m = conv.Conv1d(in_channels, out_channels, kernel_size, **kwargs)
+    nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+    if m.bias is not None:
+        nn.init.constant_(m.bias, 0)
+    return nn.utils.weight_norm(m)
+
+
+def Embedding(num_embeddings, embedding_dim, padding_idx, std=0.01):
+    m = nn.Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
+    m.weight.data.normal_(0, std)
+    return m
+
+
+def ConvTranspose2d(in_channels, out_channels, kernel_size, **kwargs):
     freq_axis_kernel_size = kernel_size[0]
     m = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, **kwargs)
     m.weight.data.fill_(1.0 / freq_axis_kernel_size)
     m.bias.data.zero_()
-    if weight_normalization:
-        return nn.utils.weight_norm(m)
-    else:
-        return m
+    return nn.utils.weight_norm(m)
 
 
-def Conv1d1x1(in_channels, out_channels, bias=True, weight_normalization=True):
+def Conv1d1x1(in_channels, out_channels, bias=True):
     """1-by-1 convolution layer
     """
-    if weight_normalization:
-        from deepvoice3_pytorch.modules import Conv1d
-        assert bias
-        return Conv1d(in_channels, out_channels, kernel_size=1, padding=0,
-                      dilation=1, bias=bias, std_mul=1.0)
-    else:
-        from deepvoice3_pytorch.conv import Conv1d
-        return Conv1d(in_channels, out_channels, kernel_size=1, padding=0,
-                      dilation=1, bias=bias)
+    return Conv1d(in_channels, out_channels, kernel_size=1, padding=0,
+                  dilation=1, bias=bias)
 
 
 def _conv1x1_forward(conv, x, is_incremental):
@@ -63,15 +66,13 @@ class ResidualConv1dGLU(nn.Module):
         padding (int): Padding for convolution layers. If None, proper padding
           is computed depends on dilation and kernel_size.
         dilation (int): Dilation factor.
-        weight_normalization (bool): If True, DeepVoice3-style weight
-          normalization is applied.
     """
 
     def __init__(self, residual_channels, gate_channels, kernel_size,
                  skip_out_channels=None,
                  cin_channels=-1, gin_channels=-1,
                  dropout=1 - 0.95, padding=None, dilation=1, causal=True,
-                 bias=True, weight_normalization=True, *args, **kwargs):
+                 bias=True, *args, **kwargs):
         super(ResidualConv1dGLU, self).__init__()
         self.dropout = dropout
         if skip_out_channels is None:
@@ -84,39 +85,26 @@ class ResidualConv1dGLU(nn.Module):
                 padding = (kernel_size - 1) // 2 * dilation
         self.causal = causal
 
-        if weight_normalization:
-            from deepvoice3_pytorch.modules import Conv1d
-            assert bias
-            self.conv = Conv1d(residual_channels, gate_channels, kernel_size,
-                               dropout=dropout, padding=padding, dilation=dilation,
-                               bias=bias, std_mul=1.0, *args, **kwargs)
-        else:
-            from deepvoice3_pytorch.conv import Conv1d
-            self.conv = Conv1d(residual_channels, gate_channels, kernel_size,
-                               padding=padding, dilation=dilation,
-                               bias=bias, *args, **kwargs)
+        self.conv = Conv1d(residual_channels, gate_channels, kernel_size,
+                           padding=padding, dilation=dilation,
+                           bias=bias, *args, **kwargs)
 
         # local conditioning
         if cin_channels > 0:
-            self.conv1x1c = Conv1d1x1(cin_channels, gate_channels,
-                                      bias=bias,
-                                      weight_normalization=weight_normalization)
+            self.conv1x1c = Conv1d1x1(cin_channels, gate_channels, bias=False)
         else:
             self.conv1x1c = None
 
         # global conditioning
         if gin_channels > 0:
-            self.conv1x1g = Conv1d1x1(gin_channels, gate_channels, bias=bias,
-                                      weight_normalization=weight_normalization)
+            self.conv1x1g = Conv1d1x1(gin_channels, gate_channels, bias=False)
         else:
             self.conv1x1g = None
 
         # conv output is split into two groups
         gate_out_channels = gate_channels // 2
-        self.conv1x1_out = Conv1d1x1(gate_out_channels, residual_channels, bias=bias,
-                                     weight_normalization=weight_normalization)
-        self.conv1x1_skip = Conv1d1x1(gate_out_channels, skip_out_channels, bias=bias,
-                                      weight_normalization=weight_normalization)
+        self.conv1x1_out = Conv1d1x1(gate_out_channels, residual_channels, bias=bias)
+        self.conv1x1_skip = Conv1d1x1(gate_out_channels, skip_out_channels, bias=bias)
 
     def forward(self, x, c=None, g=None):
         return self._forward(x, c, g, False)
@@ -128,13 +116,13 @@ class ResidualConv1dGLU(nn.Module):
         """Forward
 
         Args:
-            x (Variable): B x C x T
-            c (Variable): B x C x T, Local conditioning features
-            g (Variable): B x C x T, Expanded global conditioning features
+            x (Tensor): B x C x T
+            c (Tensor): B x C x T, Local conditioning features
+            g (Tensor): B x C x T, Expanded global conditioning features
             is_incremental (Bool) : Whether incremental mode or not
 
         Returns:
-            Variable: output
+            Tensor: output
         """
         residual = x
         x = F.dropout(x, p=self.dropout, training=self.training)
@@ -163,7 +151,7 @@ class ResidualConv1dGLU(nn.Module):
             ga, gb = g.split(g.size(splitdim) // 2, dim=splitdim)
             a, b = a + ga, b + gb
 
-        x = F.tanh(a) * F.sigmoid(b)
+        x = torch.tanh(a) * torch.sigmoid(b)
 
         # For skip connection
         s = _conv1x1_forward(self.conv1x1_skip, x, is_incremental)
@@ -175,7 +163,7 @@ class ResidualConv1dGLU(nn.Module):
         return x, s
 
     def clear_buffer(self):
-        for conv in [self.conv, self.conv1x1_out, self.conv1x1_skip,
-                     self.conv1x1c, self.conv1x1g]:
-            if conv is not None:
-                self.conv.clear_buffer()
+        for c in [self.conv, self.conv1x1_out, self.conv1x1_skip,
+                  self.conv1x1c, self.conv1x1g]:
+            if c is not None:
+                c.clear_buffer()
